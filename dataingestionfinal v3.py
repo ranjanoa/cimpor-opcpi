@@ -312,16 +312,42 @@ class OPCInfluxWorker(QThread):
 
                 while self._is_running:
                     try:
-                        values = await client.get_values(nodes)
+                        datavalues = await client.read_values(nodes)
                         timestamp = datetime.now(timezone.utc)
                         point = Point(self.db_measurement).time(timestamp, WritePrecision.NS)
 
                         log_samples = []
-                        for i, val in enumerate(values):
+                        for i, dv in enumerate(datavalues):
                             nid = self.selected_tags_nodeids[i]
                             tag_name = self.selected_tags.get(nid, nid)
                             meta = self.tag_metadata.get(nid, {"type": "Float"})
                             expected_type = meta.get("type", "Float")
+                            
+                            val = dv.Value.Value if (dv and dv.Value is not None) else None
+
+                            # If batch read returned None, try an individual read fallback
+                            if val is None:
+                                try:
+                                    node = client.get_node(nid)
+                                    individual_dv = await node.read_data_value()
+                                    val = individual_dv.Value.Value if (individual_dv and individual_dv.Value is not None) else None
+                                    if val is not None:
+                                        self.log_message.emit(f"ℹ️ Fallback read succeeded for {tag_name}: {val}")
+                                    else:
+                                        batch_status = dv.StatusCode if dv else "No DataValue"
+                                        indiv_status = individual_dv.StatusCode if individual_dv else "No DataValue"
+                                        logging.warning(
+                                            f"Tag '{tag_name}' returned None. "
+                                            f"Batch Status: {batch_status}, Individual Status: {indiv_status}"
+                                        )
+                                        self.log_message.emit(
+                                            f"⚠️ Tag '{tag_name}' returned None. "
+                                            f"Batch Status: {batch_status}, Individual Status: {indiv_status}"
+                                        )
+                                except Exception as fallback_err:
+                                    logging.warning(f"Fallback read failed for {tag_name}: {fallback_err}")
+                                    self.log_message.emit(f"❌ Fallback read failed for {tag_name}: {fallback_err}")
+
                             # VERSION 3.0 ULTRA-SILENT NULL CHECK
                             if val is None or str(type(val)) == "<class 'NoneType'>":
                                 continue  # SILENT skip for nulls (patched for type-mismatch)
