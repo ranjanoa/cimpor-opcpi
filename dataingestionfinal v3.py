@@ -292,16 +292,17 @@ class OPCInfluxWorker(QThread):
         self.log_message.emit("Stopping Gateway...")
 
     async def run_process(self):
-        client = Client(url=self.opc_config['url'])
-        await setup_opc_security(client, self.opc_config)
-        
         influx = InfluxDBClient(url=self.influx_config['url'], token=self.influx_config['token'],
                                 org=self.influx_config['org'])
         write_api = influx.write_api(write_options=SYNCHRONOUS)
         
         reconnect_delay = 5.0
         while self._is_running:
+            client = None
             try:
+                client = Client(url=self.opc_config['url'])
+                await setup_opc_security(client, self.opc_config)
+                
                 self.log_message.emit(f"Connecting to {self.opc_config['url']}...")
                 await asyncio.wait_for(client.connect(), timeout=10.0)
                 self.log_message.emit(f"Connected to {self.opc_config['url']}")
@@ -406,18 +407,20 @@ class OPCInfluxWorker(QThread):
                 self.connection_status.emit(False)
                 if not self._is_running: break
                 self.log_message.emit(f"Connection lost or error: {e}. Retrying in {reconnect_delay}s...")
-                try:
-                    await asyncio.wait_for(client.disconnect(), timeout=2.0)
-                except:
-                    pass
+                if client:
+                    try:
+                        await asyncio.wait_for(client.disconnect(), timeout=2.0)
+                    except:
+                        pass
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 1.5, 60.0) # Adaptive backoff
 
         self.log_message.emit("Gateway worker finished.")
-        try:
-            await asyncio.wait_for(client.disconnect(), timeout=2.0)
-        except:
-            pass
+        if client:
+            try:
+                await asyncio.wait_for(client.disconnect(), timeout=2.0)
+            except:
+                pass
         influx.close()
         self.worker_finished.emit()
 
@@ -446,8 +449,6 @@ class SetpointWatcherWorker(QThread):
         self.running = False
 
     async def run_loop(self):
-        client = Client(url=self.opc_config['url'])
-        await setup_opc_security(client, self.opc_config)
         influx = InfluxDBClient(
             url=self.influx_config['url'],
             token=self.influx_config['token'],
@@ -457,7 +458,11 @@ class SetpointWatcherWorker(QThread):
 
         reconnect_delay = 5.0
         while self.running:
+            client = None
             try:
+                client = Client(url=self.opc_config['url'])
+                await setup_opc_security(client, self.opc_config)
+
                 self.log_msg.emit(f"Connecting Setpoint Watcher to {self.opc_config['url']}...")
                 await asyncio.wait_for(client.connect(), timeout=10.0)
                 self.log_msg.emit(f"Setpoint Watcher Connected to {self.opc_config['url']}")
@@ -537,18 +542,20 @@ class SetpointWatcherWorker(QThread):
             except Exception as e:
                 if not self.running: break
                 self.log_msg.emit(f"Setpoint Watcher connection lost: {e}. Retrying in {reconnect_delay}s...")
-                try:
-                    await asyncio.wait_for(client.disconnect(), timeout=2.0)
-                except:
-                    pass
+                if client:
+                    try:
+                        await asyncio.wait_for(client.disconnect(), timeout=2.0)
+                    except:
+                        pass
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 1.5, 60.0) # Adaptive backoff
 
         # Cleanup
-        try:
-            await asyncio.wait_for(client.disconnect(), timeout=2.0)
-        except:
-            pass
+        if client:
+            try:
+                await asyncio.wait_for(client.disconnect(), timeout=2.0)
+            except:
+                pass
         influx.close()
 
     def run(self):
