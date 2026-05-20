@@ -313,7 +313,10 @@ class OPCInfluxWorker(QThread):
                 while self._is_running:
                     try:
                         nodeids = [node.nodeid for node in nodes]
-                        datavalues = await client.uaclient.read_attributes(nodeids, ua.AttributeIds.Value)
+                        datavalues = await asyncio.wait_for(
+                            client.uaclient.read_attributes(nodeids, ua.AttributeIds.Value),
+                            timeout=5.0
+                        )
                         timestamp = datetime.now(timezone.utc)
                         point = Point(self.db_measurement).time(timestamp, WritePrecision.NS)
 
@@ -330,7 +333,7 @@ class OPCInfluxWorker(QThread):
                             if val is None:
                                 try:
                                     node = client.get_node(nid)
-                                    individual_dv = await node.read_data_value()
+                                    individual_dv = await asyncio.wait_for(node.read_data_value(), timeout=2.0)
                                     val = individual_dv.Value.Value if (individual_dv and individual_dv.Value is not None) else None
                                     if val is not None:
                                         self.log_message.emit(f"ℹ️ Fallback read succeeded for {tag_name}: {val}")
@@ -400,13 +403,17 @@ class OPCInfluxWorker(QThread):
                 if not self._is_running: break
                 self.log_message.emit(f"Connection lost or error: {e}. Retrying in {reconnect_delay}s...")
                 try:
-                    await client.disconnect()
+                    await asyncio.wait_for(client.disconnect(), timeout=2.0)
                 except:
                     pass
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 1.5, 60.0) # Adaptive backoff
 
         self.log_message.emit("Gateway worker finished.")
+        try:
+            await asyncio.wait_for(client.disconnect(), timeout=2.0)
+        except:
+            pass
         influx.close()
         self.worker_finished.emit()
 
@@ -458,7 +465,7 @@ class SetpointWatcherWorker(QThread):
                     nd = client.get_node(nid)
                     cached_nodes[nid] = nd
                     # Fetch and store exact datatype once at startup!
-                    cached_types[nid] = await nd.read_data_type_as_variant_type()
+                    cached_types[nid] = await asyncio.wait_for(nd.read_data_type_as_variant_type(), timeout=2.0)
                 except Exception:
                     pass
 
@@ -518,7 +525,10 @@ class SetpointWatcherWorker(QThread):
         except Exception as e:
             self.log_msg.emit(f"Watcher Error: {e}")
         finally:
-            await client.disconnect()
+            try:
+                await asyncio.wait_for(client.disconnect(), timeout=2.0)
+            except:
+                pass
             influx.close()
 
     def run(self):
@@ -2125,14 +2135,6 @@ class MainWindow(QMainWindow):
             if self.simulator_worker: self.simulator_worker.stop()
             if self.watcher_worker: self.watcher_worker.stop()
             if hasattr(self, 'api_worker') and self.api_worker: self.api_worker.stop()
-            
-            # Briefly wait for workers to cleanup resources (e.g. InfluxDB final writes)
-            workers = [self.opc_worker, self.pi_worker, self.simulator_worker, self.watcher_worker]
-            if hasattr(self, 'api_worker'): workers.append(self.api_worker)
-            
-            for w in workers:
-                if w and w.isRunning():
-                    w.wait(200) # 200ms grace period per worker
             
             self._save_selections()
         except Exception as ex:
