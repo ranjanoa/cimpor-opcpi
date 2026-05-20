@@ -820,6 +820,7 @@ class PIInfluxWorker(QThread):
             # Detect mode: stream_url or classic WebID batch
             use_stream_url_mode = any(t.get('stream_url') or t['webId'].startswith('http') for t in self.pi_tags)
 
+            error_delay = 5.0
             while self._is_running:
                 try:
                     ts = datetime.now(timezone.utc)
@@ -827,9 +828,9 @@ class PIInfluxWorker(QThread):
                     log_samples = []
 
                     if use_stream_url_mode:
-                        # (rest of the streaming logic)
                         # Call each stream URL individually: GET {url}
                         for t in self.pi_tags:
+                            if not self._is_running: break
                             stream_url = t.get('stream_url') or t['webId']
                             alias = alias_map.get(t['webId'], t.get('alias', t['name']))
                             try:
@@ -892,15 +893,25 @@ class PIInfluxWorker(QThread):
                                 logging.warning(f"Skipping PI field {alias} during batch write due to non-numeric value: {raw}")
                                 continue
 
-                    write_api.write(
-                        bucket=self.influx_config['bucket'],
-                        org=self.influx_config['org'],
-                        record=point
-                    )
-                    self.data_written.emit(f"✅ PI: {', '.join(log_samples)}...")
+                    # Only write to InfluxDB if we have at least one valid data point
+                    if log_samples:
+                        write_api.write(
+                            bucket=self.influx_config['bucket'],
+                            org=self.influx_config['org'],
+                            record=point
+                        )
+                        self.data_written.emit(f"✅ PI: {', '.join(log_samples)}...")
+                    
+                    error_delay = 5.0  # Reset backoff on successful cycle
 
                 except Exception as e:
-                    self.log_message.emit(f"PI Read Error: {e}")
+                    self.log_message.emit(f"PI Read Error: {e}. Retrying in {error_delay}s...")
+                    # Adaptive backoff: wait before retry to avoid hammering a down server
+                    for _ in range(int(error_delay * 10)):
+                        if not self._is_running: break
+                        time.sleep(0.1)
+                    error_delay = min(error_delay * 1.5, 60.0)
+                    continue  # Skip normal sleep, go straight to retry
 
                 for _ in range(int(self.interval_sec * 10)):
                     if not self._is_running:
