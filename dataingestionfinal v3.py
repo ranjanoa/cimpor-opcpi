@@ -329,8 +329,10 @@ class OPCInfluxWorker(QThread):
                         point = Point(self.db_measurement).time(timestamp, WritePrecision.NS)
 
                         log_samples = []
-                        if not hasattr(self, '_dv_type_logged'):
-                            self._dv_type_logged = set()
+                        if not hasattr(self, '_diag_logged'):
+                            self._diag_logged = set()   # tags that had their full diag printed
+                        if not hasattr(self, '_error_logged'):
+                            self._error_logged = set()  # tags that had their error logged (avoid spam)
 
                         for i, dv in enumerate(datavalues):
                             nid = self.selected_tags_nodeids[i]
@@ -338,85 +340,116 @@ class OPCInfluxWorker(QThread):
                             meta = self.tag_metadata.get(nid, {"type": "Float"})
                             expected_type = meta.get("type", "Float")
 
-                            # One-time diagnostic: log the raw type structure for each tag
-                            if nid not in self._dv_type_logged:
-                                dv_type = type(dv).__name__
-                                dv_val_type = type(getattr(dv, 'Value', None)).__name__ if dv is not None else 'N/A'
-                                dv_val_val_type = type(getattr(getattr(dv, 'Value', None), 'Value', None)).__name__ if dv is not None and hasattr(dv, 'Value') else 'N/A'
-                                self.log_message.emit(
-                                    f"🔍 TYPE DIAG [{tag_name}]: dv={dv_type}, dv.Value={dv_val_type}, dv.Value.Value={dv_val_val_type}"
-                                )
-                                self._dv_type_logged.add(nid)
-
-                            # Guard: read_attributes may return a raw scalar (e.g. float) instead of a DataValue object
-                            if dv is None:
-                                val = None
-                            elif hasattr(dv, 'Value') and hasattr(dv.Value, 'Value'):
-                                val = dv.Value.Value
-                            elif hasattr(dv, 'Value'):
-                                # dv.Value is the raw value itself (no nested .Value)
-                                val = dv.Value if dv.Value is not None else None
-                            else:
-                                # dv is itself a raw scalar value
-                                val = dv
-
-                            # If batch read returned None, try an individual read fallback
-                            if val is None:
-                                try:
-                                    node = client.get_node(nid)
-                                    individual_dv = await asyncio.wait_for(node.read_data_value(), timeout=2.0)
-                                    val = individual_dv.Value.Value if (individual_dv and individual_dv.Value is not None) else None
-                                    if val is not None:
-                                        self.log_message.emit(f"ℹ️ Fallback read succeeded for {tag_name}: {val}")
-                                    else:
-                                        batch_status = dv.StatusCode if dv else "No DataValue"
-                                        indiv_status = individual_dv.StatusCode if individual_dv else "No DataValue"
-                                        logging.warning(
-                                            f"Tag '{tag_name}' returned None. "
-                                            f"Batch Status: {batch_status}, Individual Status: {indiv_status}"
-                                        )
-                                        self.log_message.emit(
-                                            f"⚠️ Tag '{tag_name}' returned None. "
-                                            f"Batch Status: {batch_status}, Individual Status: {indiv_status}"
-                                        )
-                                except Exception as fallback_err:
-                                    logging.warning(f"Fallback read failed for {tag_name}: {fallback_err}")
-                                    self.log_message.emit(f"❌ Fallback read failed for {tag_name}: {fallback_err}")
-
-                            # VERSION 3.0 ULTRA-SILENT NULL CHECK
-                            if val is None or str(type(val)) == "<class 'NoneType'>":
-                                continue  # SILENT skip for nulls (patched for type-mismatch)
-
-                            final_val = None
+                            # ── PER-TAG ISOLATION: wrap everything so one bad tag never blocks others ──
                             try:
-                                if expected_type == "String":
-                                    final_val = str(val)
-                                elif expected_type == "Bool":
-                                    final_val = bool(val)
-                                else: # Float
-                                    final_val = float(val)
-                            except (ValueError, TypeError):
-                                # Skip
-                                logging.warning(f"[V3.0] Skipping {tag_name} due to type mismatch (Expected {expected_type}, Got {type(val)})")
-                                continue
+                                # ── FULL ONE-TIME DIAGNOSTIC per tag ──────────────────────────────────
+                                if nid not in self._diag_logged:
+                                    import traceback as _tb
+                                    try:
+                                        status_code   = getattr(dv, 'StatusCode', 'N/A')
+                                        variant       = getattr(dv, 'Value', '<<no .Value attr>>')
+                                        variant_type  = getattr(variant, 'VariantType', 'N/A')
+                                        inner_val     = getattr(variant, 'Value', '<<no .Value.Value attr>>')
+                                        inner_type    = type(inner_val).__name__
+                                        raw_repr      = repr(dv)[:200]   # truncate for safety
+                                        self.log_message.emit(
+                                            f"━━━━ DIAG [{tag_name}] ━━━━\n"
+                                            f"  NodeID      : {nid}\n"
+                                            f"  dv type     : {type(dv).__name__}\n"
+                                            f"  StatusCode  : {status_code}\n"
+                                            f"  dv.Value    : {type(variant).__name__}\n"
+                                            f"  VariantType : {variant_type}\n"
+                                            f"  inner value : {inner_val!r} ({inner_type})\n"
+                                            f"  repr(dv)    : {raw_repr}"
+                                        )
+                                    except Exception as diag_err:
+                                        self.log_message.emit(f"  DIAG ERROR for {tag_name}: {diag_err}")
+                                    self._diag_logged.add(nid)
 
-                            if expected_type == "Float":
-                                if nid not in self.value_history:
-                                    self.value_history[nid] = deque(maxlen=5)
-
-                                if final_val == 0.0 and len(self.value_history[nid]) > 0:
-                                    avg = sum(self.value_history[nid]) / len(self.value_history[nid])
-                                    if abs(avg) > 0.01:
-                                        final_val = avg
+                                # ── VALUE EXTRACTION ──────────────────────────────────────────────────
+                                val = None
+                                if dv is None:
+                                    val = None
+                                elif hasattr(dv, 'Value') and hasattr(dv.Value, 'Value'):
+                                    val = dv.Value.Value
+                                elif hasattr(dv, 'Value'):
+                                    val = dv.Value if dv.Value is not None else None
                                 else:
-                                    self.value_history[nid].append(final_val)
+                                    val = dv   # raw scalar
 
-                            if final_val is not None:
-                                point.field(tag_name, final_val)
-                                self.live_data_update.emit(nid, final_val)
-                                if len(log_samples) < 3: log_samples.append(f"{tag_name}={final_val}")
-                                # Temporary Trace Log
-                                self.log_message.emit(f"DEBUG Trace: {tag_name} = {final_val}")
+                                # ── FALLBACK individual read if batch returned None ─────────────────
+                                if val is None:
+                                    try:
+                                        _node = client.get_node(nid)
+                                        individual_dv = await asyncio.wait_for(_node.read_data_value(), timeout=2.0)
+                                        if individual_dv and individual_dv.Value is not None:
+                                            if hasattr(individual_dv.Value, 'Value'):
+                                                val = individual_dv.Value.Value
+                                            else:
+                                                val = individual_dv.Value
+                                        if val is not None:
+                                            self.log_message.emit(f"ℹ️ Fallback OK [{tag_name}]: {val!r}")
+                                        else:
+                                            sc_batch  = getattr(dv, 'StatusCode', 'N/A')
+                                            sc_indiv  = getattr(individual_dv, 'StatusCode', 'N/A')
+                                            self.log_message.emit(
+                                                f"⚠️ [{tag_name}] still None after fallback. "
+                                                f"BatchSC={sc_batch}  IndivSC={sc_indiv}"
+                                            )
+                                    except Exception as fallback_err:
+                                        self.log_message.emit(f"❌ Fallback EXCEPTION [{tag_name}]: {fallback_err}")
+
+                                if val is None:
+                                    continue  # nothing to write
+
+                                # ── TYPE COERCION ─────────────────────────────────────────────────────
+                                final_val = None
+                                try:
+                                    if expected_type == "String":
+                                        final_val = str(val)
+                                    elif expected_type == "Bool":
+                                        final_val = bool(val)
+                                    else:
+                                        final_val = float(val)
+                                except (ValueError, TypeError) as coerce_err:
+                                    if nid not in self._error_logged:
+                                        self.log_message.emit(
+                                            f"⚠️ TYPE COERCE FAIL [{tag_name}]: "
+                                            f"expected={expected_type}, got={type(val).__name__}, val={val!r}, err={coerce_err}"
+                                        )
+                                        self._error_logged.add(nid)
+                                    continue
+
+                                # ── ZERO-SPIKE SMOOTHING (Float only) ─────────────────────────────────
+                                if expected_type == "Float":
+                                    if nid not in self.value_history:
+                                        self.value_history[nid] = deque(maxlen=5)
+                                    if final_val == 0.0 and len(self.value_history[nid]) > 0:
+                                        avg = sum(self.value_history[nid]) / len(self.value_history[nid])
+                                        if abs(avg) > 0.01:
+                                            final_val = avg
+                                    else:
+                                        self.value_history[nid].append(final_val)
+
+                                if final_val is not None:
+                                    point.field(tag_name, final_val)
+                                    self.live_data_update.emit(nid, final_val)
+                                    if len(log_samples) < 3:
+                                        log_samples.append(f"{tag_name}={final_val}")
+                                    self.log_message.emit(f"DEBUG Trace: {tag_name} = {final_val}")
+
+                            except Exception as per_tag_err:
+                                # Catch-all: log once per tag so we never silently lose a tag
+                                if nid not in self._error_logged:
+                                    import traceback as _tb
+                                    self.log_message.emit(
+                                        f"🔴 PER-TAG ERROR [{tag_name}] ({nid}):\n"
+                                        f"  {per_tag_err}\n"
+                                        f"  dv repr: {repr(dv)[:300]}\n"
+                                        + "".join(_tb.format_exc().splitlines(keepends=True)[-6:])
+                                    )
+                                    self._error_logged.add(nid)
+                                continue  # skip this tag, keep processing the rest
 
                         if log_samples:
                             write_api.write(bucket=self.influx_config['bucket'], org=self.influx_config['org'], record=point)
