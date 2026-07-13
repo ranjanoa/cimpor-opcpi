@@ -272,7 +272,8 @@ class OPCSubscriptionHandler:
 
     def datachange_notification(self, node, val, data):
         try:
-            self.worker.handle_subscription_notification(node, data)
+            dv = getattr(data.monitored_item, 'Value', val) if hasattr(data, 'monitored_item') else val
+            self.worker.handle_subscription_notification(node, dv)
         except Exception as e:
             logging.error(f"Error in datachange_notification: {e}")
 
@@ -442,7 +443,8 @@ class OPCInfluxWorker(QThread):
                     # 1. Connection check (every 5 seconds)
                     now = time.time()
                     if now - last_conn_check > 5.0:
-                        await client.read_value(ua.NodeId(ua.ObjectIds.Server_ServerStatus_CurrentTime))
+                        node = client.get_node(ua.NodeId(ua.ObjectIds.Server_ServerStatus_CurrentTime))
+                        await node.read_value()
                         last_conn_check = now
 
                     # 2. Write pending updates to InfluxDB
