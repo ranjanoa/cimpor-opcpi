@@ -1195,7 +1195,7 @@ class MainWindow(QMainWindow):
         self.write_on_change_radio = QRadioButton("On Change")
         self.write_interval_spinbox = QSpinBox()
         self.write_interval_spinbox.setRange(100, 60000)
-        self.write_interval_spinbox.setValue(self.selections.get("write_interval", 1000)) # Load interval
+        self.write_interval_spinbox.setValue(int(self.selections.get("write_interval", 1000))) # Load interval
         self.write_per_sec_radio.setChecked(True)
         h2.addWidget(self.write_per_sec_radio)
         h2.addWidget(self.write_interval_spinbox)
@@ -1278,7 +1278,7 @@ class MainWindow(QMainWindow):
         h7 = QHBoxLayout()
         self.api_port_input = QSpinBox()
         self.api_port_input.setRange(1000, 65535)
-        self.api_port_input.setValue(self.selections.get("api_port", 8000))
+        self.api_port_input.setValue(int(self.selections.get("api_port", 8000)))
         self.start_api_button = QPushButton("▶ Start API")
         self.start_api_button.clicked.connect(self.start_api)
         self.stop_api_button = QPushButton("■ Stop API")
@@ -1338,7 +1338,7 @@ class MainWindow(QMainWindow):
         h8b = QHBoxLayout()
         self.pi_interval_spin = QSpinBox()
         self.pi_interval_spin.setRange(1, 3600)
-        self.pi_interval_spin.setValue(self.selections.get("pi_interval", 5))
+        self.pi_interval_spin.setValue(int(self.selections.get("pi_interval", 5)))
         self.pi_interval_spin.setSuffix(" s")
         self.start_pi_button = QPushButton("▶ Start PI")
         self.start_pi_button.clicked.connect(self.start_pi_gateway)
